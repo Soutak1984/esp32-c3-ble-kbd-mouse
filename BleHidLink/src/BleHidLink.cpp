@@ -91,8 +91,20 @@ static bool labeledInt(const char* text, const char* key, long* out) {
   return true;
 }
 
-BleHidLink::BleHidLink(Stream& port) : _port(&port), _len(0), _drop(false) {
+BleHidLink::BleHidLink(Stream& port) : _port(&port), _len(0), _drop(false), _activity(false) {
   _line[0] = '\0';
+}
+
+void BleHidLink::onActivity() {
+  _activity = true;
+}
+
+bool BleHidLink::takeActivity() {
+  noInterrupts();
+  bool pending = _activity;
+  _activity = false;
+  interrupts();
+  return pending;
 }
 
 bool BleHidLink::poll(BleHidEvent& event) {
@@ -188,7 +200,7 @@ bool BleHidLink::parseLine(BleHidEvent& event) {
     rest++;
   }
   copyText(event.text, sizeof(event.text), rest);
-  event.released = strcmp(rest, "(up)") == 0;
+  event.released = strcmp(rest, "null") == 0;
 
   if (event.type == BLE_HID_KEYBOARD) {
     event.modifiers = bitsFromTokens(rest, modifierBit);

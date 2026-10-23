@@ -56,11 +56,18 @@ class BleHidLink {
   void setPin(uint32_t pin);
   void send(const char* line);
 
+  // The ESP32-C3 activity pin pulses high on a key press or a mouse move.
+  // Call this from the interrupt on the GPIO wired to that pin.
+  void onActivity();
+  // True once after onActivity, then the flag is cleared.
+  bool takeActivity();
+
  private:
   Stream* _port;
   char _line[160];
   uint8_t _len;
   bool _drop;
+  volatile bool _activity;
 
   bool parseLine(BleHidEvent& event);
 };

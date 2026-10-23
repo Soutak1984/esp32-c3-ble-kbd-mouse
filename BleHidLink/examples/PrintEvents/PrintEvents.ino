@@ -5,9 +5,15 @@
   on the USB serial port.
 
   Wiring, 3.3 V logic, common ground:
-    ESP32-C3 GPIO4 TX -> this board RX
-    ESP32-C3 GPIO5 RX <- this board TX
-    ESP32-C3 GND      -> this board GND
+    ESP32-C3 GPIO4 TX  -> this board RX
+    ESP32-C3 GPIO5 RX  <- this board TX
+    ESP32-C3 GPIO6 OUT -> this board activity pin (idle low, pulses high)
+    ESP32-C3 GND       -> this board GND
+
+  GPIO6 goes high for about 20 ms when a key is pressed or the mouse moves.
+  The example uses that rising edge as an interrupt.
+  Uno and Nano keep the software UART on pins 2 and 3, so the activity
+  pin is polled on pin 4. Other boards use pin 2 as a real interrupt.
 
   Baud must match kLinkBaud in esp32c3_ble_hid_host.ino.
   Hardware UART boards keep the default 115200.
@@ -36,6 +42,44 @@ static const unsigned long LINK_BAUD = 115200;
 
 BleHidLink link(linkPort);
 
+#if defined(ARDUINO_ARCH_AVR) && !defined(HAVE_HWSERIAL1)
+static const int kActivityPin = 4;
+static const bool kActivityIrq = false;
+#else
+static const int kActivityPin = 2;
+static const bool kActivityIrq = true;
+#endif
+
+static volatile uint8_t gActivityEdges = 0;
+
+#if defined(ESP8266) || defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+void IRAM_ATTR activityIsr() {
+  gActivityEdges = 1;
+}
+#else
+void activityIsr() {
+  link.onActivity();
+}
+#endif
+
+void pollActivityPin() {
+#if defined(ESP8266) || defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+  if (gActivityEdges != 0) {
+    gActivityEdges = 0;
+    link.onActivity();
+  }
+#endif
+  if (kActivityIrq) {
+    return;
+  }
+  static int lastLevel = LOW;
+  int level = digitalRead(kActivityPin);
+  if (lastLevel == LOW && level == HIGH) {
+    link.onActivity();
+  }
+  lastLevel = level;
+}
+
 static const char* buttonName(uint8_t buttons) {
   if (buttons == 0) {
     return "-";
@@ -46,6 +90,10 @@ static const char* buttonName(uint8_t buttons) {
 void setup() {
   Serial.begin(115200);
   linkPort.begin(LINK_BAUD);
+  pinMode(kActivityPin, INPUT);
+  if (kActivityIrq && digitalPinToInterrupt(kActivityPin) != NOT_AN_INTERRUPT) {
+    attachInterrupt(digitalPinToInterrupt(kActivityPin), activityIsr, RISING);
+  }
   Serial.println("BleHidLink example");
   Serial.println("Waiting for the ESP32-C3...");
 }
@@ -55,6 +103,11 @@ void loop() {
   if (!asked && millis() > 2000) {
     asked = true;
     link.status();
+  }
+
+  pollActivityPin();
+  if (link.takeActivity()) {
+    Serial.println("ACTIVITY");
   }
 
   BleHidEvent event;

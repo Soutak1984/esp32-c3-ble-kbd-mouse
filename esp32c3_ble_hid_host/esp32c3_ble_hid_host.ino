@@ -29,6 +29,24 @@
  *
  * Optional filters. Leave a string empty to take the first match.
  * Set kUsePasskey if the keyboard will not pair with "Just Works".
+ *
+ * Pins (change the matching setting below, or set it to -1 to disable):
+ *   GPIO4   kLinkTxPin       UART TX to the other MCU RX. 115200 8N1.
+ *   GPIO5   kLinkRxPin       UART RX from the other MCU TX. Share ground.
+ *   GPIO6   kActivityPin     Output. High for 20 ms on a key press or mouse move.
+ *   GPIO7   kHexPin          Input, pull-up on. Open: typed characters.
+ *                            Tied to ground: print the pressed key as hex.
+ *   GPIO9   kBootPin         BOOT button, active low.
+ *                            Short press: pair a new keyboard or mouse.
+ *                            Hold 5 seconds: forget every paired device.
+ *   GPIO10  kKeyboardLedPin  Output. High while a keyboard is connected.
+ *   GPIO3   kMouseLedPin     Output. High while a mouse is connected.
+ *   GPIO18  USB D-           Leave free while USB is in use.
+ *   GPIO19  USB D+           Leave free while USB is in use.
+ *
+ * Each LED goes from its pin to ground through a resistor (about 330 ohm
+ * to 1 kohm). A keyboard that is also a mouse lights both LEDs.
+ * Both UART sides are 3.3 V logic.
  */
 
 #include <Arduino.h>
@@ -59,7 +77,27 @@ static const uint32_t kLinkBaud = 115200;
 // ESP32-C3 BOOT button. It is GPIO9, active low, on DevKit and Super Mini
 // boards. Press it to scan for a keyboard or mouse that is not connected.
 // Set this to -1 if the board has no BOOT button on a GPIO.
+// A short press pairs a new device. Hold for kBootForgetMs to erase bonds.
 static const int kBootPin = 9;
+static const uint32_t kBootForgetMs = 5000;
+
+// Activity output for the other microcontroller. Idle is low.
+// It goes high for kActivityPulseMs on a key press or a mouse move.
+// Set kActivityPin to -1 to disable it. Leave GPIO18 and GPIO19 free for USB.
+static const int kActivityPin = 6;
+static const uint32_t kActivityPulseMs = 20;
+
+// Hex mode input. Internal pull-up is on, so leave the pin open for normal
+// characters. Tie it to ground to print each pressed key as a hex usage
+// instead, such as 1D for z and E0 for left Control. Set to -1 to disable.
+static const int kHexPin = 7;
+
+// Status LEDs. Each pin goes high while that device is connected, and low
+// when it is not. Wire the LED from the pin to ground through a resistor.
+// A keyboard that is also a mouse lights both. Set either pin to -1 to
+// disable it. Leave GPIO18 and GPIO19 free for USB.
+static const int kKeyboardLedPin = 10;
+static const int kMouseLedPin = 3;
 
 // ---- HID identifiers --------------------------------------------------------
 
@@ -114,6 +152,7 @@ struct Slot {
   ReportMeta reports[kMaxReports];
   uint8_t reportCount;
   bool haveLastKey;
+  bool capsLock;
   uint8_t lastMod;
   uint8_t lastKeys[6];
   bool haveLastMouse;
@@ -155,10 +194,12 @@ static uint32_t gNextScanMs = 0;
 static int gScanNote = -1;
 static bool gLinksRelaxed = false;
 static bool gAllowScan = false;
+static bool gPairNew = false;
 static char gUsbCmd[48];
 static uint8_t gUsbCmdLen = 0;
 static char gLinkCmd[48];
 static uint8_t gLinkCmdLen = 0;
+static volatile uint32_t gActivityUntil = 0;
 static volatile uint32_t gRuntimePasskey = 0;
 bool gReadyNoted = false;
 bool gBleReady = false;
@@ -309,6 +350,7 @@ void clearSlot(int index) {
   slot.idCount = 0;
   slot.reportCount = 0;
   slot.haveLastKey = false;
+  slot.capsLock = false;
   slot.lastMod = 0;
   memset(slot.lastKeys, 0, sizeof(slot.lastKeys));
   slot.haveLastMouse = false;
@@ -642,6 +684,42 @@ void appendPiece(char* buf, size_t cap, size_t& used, const char* piece, bool wi
   }
 }
 
+bool codeInKeys(const uint8_t* codes, uint8_t code) {
+  for (int i = 0; i < 6; i++) {
+    if (codes[i] == code) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const char* shiftedSymbol(uint8_t code) {
+  switch (code) {
+    case 0x1E: return "!";
+    case 0x1F: return "@";
+    case 0x20: return "#";
+    case 0x21: return "$";
+    case 0x22: return "%";
+    case 0x23: return "^";
+    case 0x24: return "&";
+    case 0x25: return "*";
+    case 0x26: return "(";
+    case 0x27: return ")";
+    case 0x2D: return "_";
+    case 0x2E: return "+";
+    case 0x2F: return "{";
+    case 0x30: return "}";
+    case 0x31: return "|";
+    case 0x33: return ":";
+    case 0x34: return "\"";
+    case 0x35: return "~";
+    case 0x36: return "<";
+    case 0x37: return ">";
+    case 0x38: return "?";
+    default: return nullptr;
+  }
+}
+
 const char* keyName(uint8_t code, char* scratch, size_t scratchCap) {
   if (code >= 0x04 && code <= 0x1D) {
     scratch[0] = (char)('a' + (code - 0x04));
@@ -745,6 +823,22 @@ const char* mediaName(uint16_t usage) {
   }
 }
 
+void appendMods(char* buf, size_t cap, size_t& used, uint8_t mod, bool includeShift) {
+  const uint8_t mods[] = {0x01, 0x04, 0x08, 0x10, 0x40, 0x80};
+  const char* modNames[] = {"LCTRL", "LALT", "LGUI", "RCTRL", "RALT", "RGUI"};
+  for (int i = 0; i < 6; i++) {
+    if (mod & mods[i]) {
+      appendPiece(buf, cap, used, modNames[i], true);
+    }
+  }
+  if (includeShift && (mod & 0x02) != 0) {
+    appendPiece(buf, cap, used, "LSHIFT", true);
+  }
+  if (includeShift && (mod & 0x20) != 0) {
+    appendPiece(buf, cap, used, "RSHIFT", true);
+  }
+}
+
 void appendHex(char* buf, size_t cap, size_t& used, const uint8_t* data, size_t length) {
   for (size_t i = 0; i < length && used + 4 < cap; i++) {
     int wrote = snprintf(buf + used, cap - used, "%s%02X", (i == 0) ? "" : " ", data[i]);
@@ -769,34 +863,91 @@ void emitKeyboard(int slotIndex, const uint8_t* payload, size_t length) {
     keys++;
     keyLen--;
   }
-  if (keyLen < 8) {
+
+  // A normal report is 8 bytes: modifier, reserved, six keys.
+  // This keyboard sends 7: the report ID was removed, so the last key slot
+  // is missing. Control then looked like "00 00 00 00 00 00 00".
+  uint8_t boot[8];
+  memset(boot, 0, sizeof(boot));
+  if (keyLen == 8) {
+    memcpy(boot, keys, 8);
+  } else if (keyLen >= 1 && keyLen < 8) {
+    boot[0] = keys[0];
+    if (keyLen >= 2 && keys[1] == 0) {
+      size_t count = keyLen - 2;
+      if (count > 6) {
+        count = 6;
+      }
+      memcpy(boot + 2, keys + 2, count);
+    } else if (keyLen >= 2) {
+      size_t count = keyLen - 1;
+      if (count > 6) {
+        count = 6;
+      }
+      memcpy(boot + 2, keys + 1, count);
+    }
+  } else {
     char line[160];
     size_t used = (size_t)snprintf(line, sizeof(line), "KBD  %s [%s] ", slot.name, slot.addr);
     appendHex(line, sizeof(line), used, payload, length);
     enqueueLine(line);
+    pulseActivity();
     return;
   }
 
-  uint8_t mod = keys[0];
-  const uint8_t* codes = keys + 2;
+  uint8_t mod = boot[0];
+  const uint8_t* codes = boot + 2;
   bool same = slot.haveLastKey && slot.lastMod == mod && memcmp(slot.lastKeys, codes, 6) == 0;
   if (same) {
     return;
+  }
+  if (codeInKeys(codes, 0x39) && !codeInKeys(slot.lastKeys, 0x39)) {
+    slot.capsLock = !slot.capsLock;
   }
   slot.haveLastKey = true;
   slot.lastMod = mod;
   memcpy(slot.lastKeys, codes, 6);
 
-  char body[96];
-  size_t used = 0;
-  body[0] = '\0';
-  const uint8_t mods[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
-  const char* modNames[] = {"LCTRL", "LSHIFT", "LALT", "LGUI", "RCTRL", "RSHIFT", "RALT", "RGUI"};
-  for (int i = 0; i < 8; i++) {
-    if (mod & mods[i]) {
-      appendPiece(body, sizeof(body), used, modNames[i], true);
+  if (kHexPin >= 0 && digitalRead(kHexPin) == LOW) {
+    char body[48];
+    size_t used = 0;
+    body[0] = '\0';
+    for (int bit = 0; bit < 8; bit++) {
+      if ((mod & (1 << bit)) == 0) {
+        continue;
+      }
+      int wrote = snprintf(body + used, sizeof(body) - used, "%s%02X", used == 0 ? "" : " ", 0xE0 + bit);
+      if (wrote > 0 && used + (size_t)wrote < sizeof(body)) {
+        used += (size_t)wrote;
+      }
     }
+    for (int i = 0; i < 6; i++) {
+      if (codes[i] == 0) {
+        continue;
+      }
+      int wrote = snprintf(body + used, sizeof(body) - used, "%s%02X", used == 0 ? "" : " ", codes[i]);
+      if (wrote > 0 && used + (size_t)wrote < sizeof(body)) {
+        used += (size_t)wrote;
+      }
+    }
+    if (used == 0) {
+      return;
+    }
+    char line[160];
+    snprintf(line, sizeof(line), "KBD  %s [%s] %s", slot.name, slot.addr, body);
+    enqueueLine(line);
+    pulseActivity();
+    return;
   }
+
+  bool shift = (mod & 0x22) != 0;
+  bool letterUp = shift != slot.capsLock;
+  char keysText[64];
+  size_t keyUsed = 0;
+  keysText[0] = '\0';
+  bool anyKey = false;
+  bool shiftLeftover = false;
+
   bool rollover = codes[0] == 0x01;
   for (int i = 1; i < 6; i++) {
     if (codes[i] != 0x01) {
@@ -804,24 +955,60 @@ void emitKeyboard(int slotIndex, const uint8_t* payload, size_t length) {
     }
   }
   if (rollover) {
-    appendPiece(body, sizeof(body), used, "ErrorRollOver", true);
+    appendPiece(keysText, sizeof(keysText), keyUsed, "ErrorRollOver", true);
+    anyKey = true;
+    shiftLeftover = shift;
   } else {
     for (int i = 0; i < 6; i++) {
-      if (codes[i] == 0) {
+      uint8_t code = codes[i];
+      if (code == 0 || code == 0x39) {
         continue;
       }
+      anyKey = true;
       char scratch[8];
-      appendPiece(body, sizeof(body), used, keyName(codes[i], scratch, sizeof(scratch)), true);
+      const char* name;
+      if (code >= 0x04 && code <= 0x1D) {
+        scratch[0] = (char)((letterUp ? 'A' : 'a') + (code - 0x04));
+        scratch[1] = '\0';
+        name = scratch;
+      } else {
+        const char* symbol = shift ? shiftedSymbol(code) : nullptr;
+        if (symbol != nullptr) {
+          name = symbol;
+        } else {
+          name = keyName(code, scratch, sizeof(scratch));
+          if (shift) {
+            shiftLeftover = true;
+          }
+        }
+      }
+      appendPiece(keysText, sizeof(keysText), keyUsed, name, true);
     }
   }
-  if (used == 0) {
-    strncpy(body, "(up)", sizeof(body) - 1);
+
+  bool otherMod = (mod & ~0x22) != 0;
+  char body[96];
+  size_t used = 0;
+  body[0] = '\0';
+  if (!anyKey && mod != 0 && !otherMod) {
+    return;
+  }
+  if (!anyKey && !otherMod) {
+    strncpy(body, "null", sizeof(body) - 1);
     body[sizeof(body) - 1] = '\0';
+  } else {
+    appendMods(body, sizeof(body), used, mod, shiftLeftover || !anyKey);
+    if (anyKey) {
+      appendPiece(body, sizeof(body), used, keysText, true);
+    }
   }
 
   char line[160];
   snprintf(line, sizeof(line), "KBD  %s [%s] %s", slot.name, slot.addr, body);
   enqueueLine(line);
+  if (anyKey || otherMod) {
+    pulseActivity();
+  }
 }
 
 void emitMouse(int slotIndex, const uint8_t* p, size_t n) {
@@ -914,11 +1101,15 @@ void emitMouse(int slotIndex, const uint8_t* p, size_t n) {
     }
   }
 
+  bool moved = slot.accX != 0 || slot.accY != 0;
   char line[160];
   snprintf(line, sizeof(line), "MOUSE %s [%s] %s x=%ld y=%ld wheel=%ld pan=%ld",
            slot.name, slot.addr, buttonsText, (long)slot.accX, (long)slot.accY, (long)slot.accWheel,
            (long)slot.accPan);
   enqueueLine(line);
+  if (moved) {
+    pulseActivity();
+  }
 
   slot.haveLastMouse = true;
   slot.lastButtons = buttons;
@@ -945,7 +1136,7 @@ void emitConsumer(int slotIndex, const uint8_t* p, size_t n) {
 
   char line[160];
   if (usage == 0) {
-    snprintf(line, sizeof(line), "MEDIA %s [%s] (up)", slot.name, slot.addr);
+    snprintf(line, sizeof(line), "MEDIA %s [%s] null", slot.name, slot.addr);
   } else {
     const char* name = mediaName(usage);
     if (name != nullptr) {
@@ -1036,6 +1227,10 @@ bool shouldTake(const NimBLEAdvertisedDevice* device) {
   if (already != nullptr && already->isConnected()) {
     return false;
   }
+  bool bonded = NimBLEDevice::isBonded(device->getAddress());
+  if (!bonded && !gPairNew) {
+    return false;
+  }
 
   uint16_t appearance = device->haveAppearance() ? device->getAppearance() : 0;
   bool service = device->isAdvertisingService(NimBLEUUID((uint16_t)kHidService));
@@ -1044,7 +1239,7 @@ bool shouldTake(const NimBLEAdvertisedDevice* device) {
   bool nameMouse = containsText(name, "mouse") || containsText(name, "trackball") || containsText(name, "trackpad");
   bool filterKeyboard = kKeyboardName[0] != '\0' && nameAllowed(name, kKeyboardName);
   bool filterMouse = kMouseName[0] != '\0' && nameAllowed(name, kMouseName);
-  if (!service && !appearanceHid && !nameKeyboard && !nameMouse && !filterKeyboard && !filterMouse) {
+  if (!bonded && !service && !appearanceHid && !nameKeyboard && !nameMouse && !filterKeyboard && !filterMouse) {
     return false;
   }
 
@@ -1259,7 +1454,19 @@ bool connectToServer(const NimBLEAdvertisedDevice* device) {
   copyText(slot.addr, sizeof(slot.addr), peer, advAddr.c_str());
   slot.appearance = device->haveAppearance() ? device->getAppearance() : 0;
 
-  logf("Connected to %s [%s], RSSI %d. Pairing...", slot.name, slot.addr, client->getRssi());
+  bool bonded = NimBLEDevice::isBonded(device->getAddress()) || NimBLEDevice::isBonded(client->getPeerAddress());
+  if (!bonded && !gPairNew) {
+    logf("%s is not paired. Press BOOT to pair a new device.", slot.name);
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    clearSlot(slotIndex);
+    return false;
+  }
+  if (bonded) {
+    logf("Connected to %s [%s]. Using the saved bond.", slot.name, slot.addr);
+  } else {
+    logf("Connected to %s [%s]. Pairing as a new device.", slot.name, slot.addr);
+  }
   if (!client->secureConnection()) {
     logf("Pairing did not finish. Reports that require encryption will not arrive.");
     logf("If this repeats: put the device in pairing mode, or type forget.");
@@ -1442,6 +1649,7 @@ bool connectToServer(const NimBLEAdvertisedDevice* device) {
   }
   if (!stillNeed()) {
     gAllowScan = false;
+    gPairNew = false;
   } else if (gAllowScan) {
     if (!haveKeyboard()) {
       logf("Keyboard is still missing.");
@@ -1478,10 +1686,18 @@ void ClientCallbacks::onDisconnect(NimBLEClient* pClient, int reason) {
   enqueuef("Disconnected %s [%s] reason=%d", name, addr, reason);
   gScanNote = -1;
   gLinksRelaxed = false;
-  if (gAllowScan && stillNeed()) {
+  if (!stillNeed()) {
+    return;
+  }
+  // The saved device can come back. A short BOOT press is what allows a new one.
+  if (NimBLEDevice::getNumBonds() > 0 || gPairNew) {
+    gAllowScan = true;
     gWantScan = true;
+    if (!gPairNew) {
+      enqueueLine("Looking again for a paired keyboard or mouse.");
+    }
   } else {
-    enqueueLine("Press the BOOT button to scan for a new keyboard or mouse.");
+    enqueueLine("Press the BOOT button to pair a keyboard or mouse.");
   }
 }
 
@@ -1643,7 +1859,7 @@ void handleCommand(char* cmd) {
   }
   if (commandIs(cmd, "help")) {
     emitLine("Commands: status, rescan, forget, pin 123456");
-    emitLine("Press BOOT to scan for a missing keyboard or mouse.");
+    emitLine("Short BOOT press pairs a new device. Hold BOOT 5 seconds to forget bonds.");
     return;
   }
   if (commandIs(cmd, "rescan")) {
@@ -1699,6 +1915,44 @@ void pollSerial() {
   }
 }
 
+void pulseActivity() {
+  if (kActivityPin < 0) {
+    return;
+  }
+  digitalWrite(kActivityPin, HIGH);
+  uint32_t until = millis() + kActivityPulseMs;
+  if (until == 0) {
+    until = 1;
+  }
+  gActivityUntil = until;
+}
+
+void serviceLinkLeds() {
+  if (kKeyboardLedPin >= 0) {
+    digitalWrite(kKeyboardLedPin, haveKeyboard() ? HIGH : LOW);
+  }
+  if (kMouseLedPin >= 0) {
+    digitalWrite(kMouseLedPin, haveMouse() ? HIGH : LOW);
+  }
+}
+
+void serviceActivity() {
+  if (kActivityPin < 0) {
+    return;
+  }
+  uint32_t until = gActivityUntil;
+  if (until == 0) {
+    return;
+  }
+  if ((int32_t)(millis() - until) < 0) {
+    return;
+  }
+  if (gActivityUntil == until) {
+    digitalWrite(kActivityPin, LOW);
+    gActivityUntil = 0;
+  }
+}
+
 void pollBoot() {
   if (kBootPin < 0) {
     return;
@@ -1708,6 +1962,7 @@ void pollBoot() {
   static bool ready = false;
   static bool lastReleased = true;
   static bool pressed = false;
+  static bool longHandled = false;
   static uint32_t changeMs = 0;
   if (released != lastReleased) {
     lastReleased = released;
@@ -1722,11 +1977,30 @@ void pollBoot() {
     }
     return;
   }
-  if (!released && !pressed) {
-    pressed = true;
-    armScan("BOOT pressed.");
-  } else if (released) {
+  if (!released) {
+    if (!pressed) {
+      pressed = true;
+      longHandled = false;
+    }
+    if (!longHandled && (uint32_t)(now - changeMs) >= kBootForgetMs) {
+      longHandled = true;
+      emitLine("BOOT held for 5 seconds.");
+      forgetBonds();
+    }
+    return;
+  }
+  if (pressed) {
     pressed = false;
+    if (!longHandled) {
+      if (!stillNeed()) {
+        emitLine("A keyboard and a mouse are already connected.");
+        emitLine("Hold BOOT for 5 seconds to forget every paired device.");
+        return;
+      }
+      gPairNew = true;
+      clearMemory();
+      armScan("BOOT pressed. New pairing is allowed.");
+    }
   }
 }
 
@@ -1739,6 +2013,21 @@ void setup() {
   }
   if (kBootPin >= 0) {
     pinMode(kBootPin, INPUT_PULLUP);
+  }
+  if (kActivityPin >= 0) {
+    pinMode(kActivityPin, OUTPUT);
+    digitalWrite(kActivityPin, LOW);
+  }
+  if (kHexPin >= 0) {
+    pinMode(kHexPin, INPUT_PULLUP);
+  }
+  if (kKeyboardLedPin >= 0) {
+    pinMode(kKeyboardLedPin, OUTPUT);
+    digitalWrite(kKeyboardLedPin, LOW);
+  }
+  if (kMouseLedPin >= 0) {
+    pinMode(kMouseLedPin, OUTPUT);
+    digitalWrite(kMouseLedPin, LOW);
   }
   uint32_t start = millis();
   while (!Serial && (millis() - start) < 2500) {
@@ -1756,18 +2045,33 @@ void setup() {
   emitLine("This board connects TO one BLE keyboard and one BLE mouse.");
   emitLine("A second keyboard or a second mouse is not connected.");
   emitLine("Classic Bluetooth devices are not supported on ESP32-C3.");
-  emitLine("Unpair them from the PC, then put each one in pairing mode.");
-  emitLine("Press BOOT to scan for a keyboard or mouse that is missing.");
+  emitLine("On boot this board reconnects only to devices it already paired.");
+  emitLine("Short press BOOT to pair a new keyboard or mouse.");
+  emitLine("Hold BOOT for 5 seconds to forget every paired device.");
   emitLine("Commands: status, rescan, forget, pin 123456");
   emitLine("Lines look like:");
-  emitLine("  KBD   Name [addr] LSHIFT+a");
+  emitLine("  KBD   Name [addr] A");
   emitLine("  MOUSE Name [addr] L x=3 y=-1 wheel=0 pan=0");
   emitLine("  MEDIA Name [addr] VolumeUp");
   if (kLinkUart) {
     emitf("Link UART: TX GPIO%d, RX GPIO%d, %lu baud", kLinkTxPin, kLinkRxPin, (unsigned long)kLinkBaud);
   }
   if (kBootPin >= 0) {
-    emitf("BOOT button: GPIO%d", kBootPin);
+    emitf("BOOT button: GPIO%d. Short press pairs. Hold %lu ms to forget.", kBootPin,
+          (unsigned long)kBootForgetMs);
+  }
+  if (kActivityPin >= 0) {
+    emitf("Activity pin: GPIO%d, high for %lu ms on a key press or mouse move", kActivityPin,
+          (unsigned long)kActivityPulseMs);
+  }
+  if (kHexPin >= 0) {
+    emitf("Hex pin: GPIO%d, pull-up on. Tie it to GND to print key codes in hex.", kHexPin);
+  }
+  if (kKeyboardLedPin >= 0) {
+    emitf("Keyboard LED: GPIO%d, high while a keyboard is connected.", kKeyboardLedPin);
+  }
+  if (kMouseLedPin >= 0) {
+    emitf("Mouse LED: GPIO%d, high while a mouse is connected.", kMouseLedPin);
   }
 
   if (!NimBLEDevice::init("ESP32C3-HID-Host")) {
@@ -1799,8 +2103,16 @@ void setup() {
   scan->setInterval(100);
   scan->setWindow(60);
   scan->setActiveScan(true);
-  gAllowScan = true;
-  gWantScan = true;
+  gPairNew = false;
+  if (NimBLEDevice::getNumBonds() > 0) {
+    emitf("Paired devices saved: %d. Connecting only to those.", NimBLEDevice::getNumBonds());
+    gAllowScan = true;
+    gWantScan = true;
+  } else {
+    emitLine("No paired keyboard or mouse. Press BOOT to pair one.");
+    gAllowScan = false;
+    gWantScan = false;
+  }
 }
 
 void loop() {
@@ -1836,6 +2148,7 @@ void loop() {
     }
     if (!stillNeed()) {
       gAllowScan = false;
+      gPairNew = false;
     }
     bool oneLinkLimit = MYNEWT_VAL(BLE_MAX_CONNECTIONS) < 2 && connectedCount() >= 1;
     gWantScan = gAllowScan && stillNeed() && !oneLinkLimit;
@@ -1855,6 +2168,7 @@ void loop() {
 
   if (!stillNeed()) {
     gAllowScan = false;
+    gPairNew = false;
     if (!gReadyNoted) {
       gReadyNoted = true;
       logf("Receiving. Type on the keyboard or move the mouse.");
@@ -1868,6 +2182,8 @@ void loop() {
     lastNote = millis();
     if (MYNEWT_VAL(BLE_MAX_CONNECTIONS) < 2 && connectedCount() >= 1) {
       logf("One device is connected. This NimBLE build allows only one connection.");
+    } else if (!gPairNew) {
+      logf("Still looking for a paired device. Press BOOT to pair a new one.");
     } else if (!haveKeyboard() && !haveMouse()) {
       logf("Still scanning. Put the keyboard and the mouse in pairing mode. They cannot stay connected to a PC.");
     } else if (!haveKeyboard()) {
@@ -1877,6 +2193,8 @@ void loop() {
     }
   }
 
+  serviceLinkLeds();
+  serviceActivity();
   pollBoot();
   pollSerial();
   drainLines();

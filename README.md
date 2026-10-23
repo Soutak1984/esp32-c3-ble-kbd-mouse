@@ -29,24 +29,23 @@ Install the library from **Tools > Manage Libraries**. Search for `NimBLE-Arduin
 
 Unpair the keyboard and mouse from the computer before you use them here. A device that is already linked to a PC stops advertising, so the ESP32-C3 cannot see it.
 
-The board connects them one by one. Either device can be first.
+On a reset the board connects only to a keyboard and mouse it has already paired. It does not pair with a new device by itself.
 
-1. Put the first device in pairing mode and reset the ESP32-C3.
-2. Wait for `Keyboard ready` or `Mouse ready`. The log then names the device that is still missing and keeps scanning.
-3. Put the second device in pairing mode. You do not press BOOT between these two. The startup scan is still running.
-4. When the second device is ready, the log prints `Receiving...` and scanning stops.
+To pair a new one, put that device in pairing mode and short-press the BOOT button (GPIO9). The board then connects one device at a time until the missing keyboard or mouse is paired. A short press is a press shorter than 5 seconds.
 
-The host pairs with Just Works (no PIN) and stores the bond. After a reset it looks for that same keyboard and that same mouse again, still one at a time.
+Hold BOOT for 5 seconds to erase every saved bond and restart. The serial command `forget` does the same thing.
+
+After the devices are paired, a reset finds those same devices again. `rescan` looks for a missing paired device and does not accept a new one.
 
 It keeps one keyboard and one mouse. It does not connect a second keyboard or a second mouse. A keyboard with a touchpad can fill both roles by itself. In that case the log says the device is both, and scanning stops.
 
-If a device disconnects after both were connected, scanning does not start by itself. Press the BOOT button (GPIO9, active low) or type `rescan`. That looks only for the keyboard or mouse that is missing. Turn the old device off first if you want a different one in its place. While both are already connected, BOOT and `rescan` do not add another device.
+If a paired device disconnects, the board looks for that saved device again. It still will not pair a different one until you short-press BOOT. While both are already connected, BOOT does not add another device.
 
-A startup log looks like this when the keyboard is found first:
+A startup log looks like this when two devices are already paired and the keyboard is found first:
 
 ```text
-ESP32-C3 BLE HID host
-This board connects TO one BLE keyboard and one BLE mouse.
+On boot this board reconnects only to devices it already paired.
+Paired devices saved: 2. Connecting only to those.
 Scanning for a BLE keyboard and mouse...
 Found Logitech K380 [aa:bb:cc:dd:ee:ff] appearance=0x03C1
 Keyboard ready: Logitech K380
@@ -57,12 +56,21 @@ Mouse ready: MX Anywhere
 Receiving. Type on the keyboard or move the mouse.
 ```
 
-After a disconnect, BOOT prints:
+With nothing paired yet, the board waits until you short-press BOOT:
 
 ```text
-BOOT pressed.
+No paired keyboard or mouse. Press BOOT to pair one.
+BOOT pressed. New pairing is allowed.
+Looking for a keyboard.
 Looking for a mouse.
-Scanning for the mouse...
+```
+
+If a paired device drops, the board looks for that same device again:
+
+```text
+Disconnected Logitech K380 [aa:bb:cc:dd:ee:ff] reason=531
+Looking again for a paired keyboard or mouse.
+Scanning for the keyboard...
 ```
 
 ## Output lines
@@ -70,8 +78,8 @@ Scanning for the mouse...
 USB serial and the link UART print the same lines. Each line ends with a newline.
 
 ```text
-KBD   Logitech K380 [aa:bb:cc:dd:ee:ff] LSHIFT+a
-KBD   Logitech K380 [aa:bb:cc:dd:ee:ff] (up)
+KBD   Logitech K380 [aa:bb:cc:dd:ee:ff] A
+KBD   Logitech K380 [aa:bb:cc:dd:ee:ff] null
 MOUSE MX Anywhere [11:22:33:44:55:66] L x=3 y=-1 wheel=0 pan=0
 MEDIA Logitech K380 [aa:bb:cc:dd:ee:ff] VolumeUp
 RAW   Name [addr] 01 02 00
@@ -79,9 +87,9 @@ RAW   Name [addr] 01 02 00
 
 | Prefix | Meaning |
 | --- | --- |
-| `KBD` | Keyboard. Modifiers and keys are joined with `+`. `(up)` means every key was released. |
+| `KBD` | The typed character. Shift+a prints `A`, Shift+1 prints `!`. Ctrl stays in front, such as `LCTRL+c`. `null` means every key was released. The Up arrow is `Up`. Shift by itself is not printed. With GPIO7 tied to ground, the same key is only its hex usage, such as `1D` or `E0`, and a release is not printed. |
 | `MOUSE` | Buttons (`L`, `R`, `M`, `Back`, `Fwd`, or `-`), then `x`, `y`, `wheel`, and `pan`. Movement is grouped about every 40 ms. Clicks and the wheel print immediately. |
-| `MEDIA` | Volume, play, and other consumer keys. `(up)` is the release. |
+| `MEDIA` | Volume, play, and other consumer keys. `null` is the release. |
 | `RAW` | A HID report the sketch could not decode. The bytes are hex. |
 
 `NKRO` after `KBD` means the keyboard sent a bitfield report longer than the normal 6-key report. Those bytes are printed in hex.
@@ -93,7 +101,7 @@ Type these in the Serial Monitor, or send them on the link UART. End each comman
 | Command | Action |
 | --- | --- |
 | `status` | Show which devices are connected, which one is still missing, and how many bonds are stored. |
-| `rescan` | Scan for a missing keyboard or mouse, including devices that were skipped. Does nothing while both are already connected. |
+| `rescan` | Look again for a missing device that is already paired. Does not accept a new one, and does nothing while both are already connected. |
 | `forget` | Erase stored BLE bonds and restart. |
 | `pin 123456` | Passkey to send the next time a device asks for one. |
 | `help` | Print the command list. |
@@ -108,7 +116,10 @@ Default wiring:
 | --- | --- |
 | GPIO4 (TX) | RX |
 | GPIO5 (RX) | TX |
+| GPIO6 (activity) | Interrupt input |
 | GND | GND |
+
+GPIO6 is an output. It sits low, then goes high for 20 ms when a key is pressed or the mouse moves. A click or a wheel change with no movement leaves it low. Wire it to an interrupt input on the other microcontroller. `BleHidLink` records that edge with `onActivity()`, and `takeActivity()` reports it once.
 
 Settings are **115200 baud, 8 data bits, no parity, 1 stop bit**.
 
@@ -144,12 +155,19 @@ These are at the top of `esp32c3_ble_hid_host.ino`.
 | `kLinkUart` | `true` enables the GPIO UART. |
 | `kLinkTxPin`, `kLinkRxPin`, `kLinkBaud` | UART pins and speed. |
 | `kBootPin` | BOOT button pin. Default is GPIO9, active low. Set to `-1` to disable it. |
+| `kActivityPin` | Output that pulses on a key press or mouse move. Default is GPIO6. Set to `-1` to disable it. |
+| `kHexPin` | Input with pull-up. Default is GPIO7. Leave it open for characters. Tie it to GND to print pressed keys as hex, such as `1D` or `E0`. Set to `-1` to disable it. |
+| `kKeyboardLedPin` | Keyboard link LED. Default is GPIO10. High while a keyboard is connected. Set to `-1` to disable it. |
+| `kMouseLedPin` | Mouse link LED. Default is GPIO3. High while a mouse is connected. Set to `-1` to disable it. |
+| `kActivityPulseMs` | How long that pulse stays high. Default is 20 ms. |
+
+Wire each LED from the pin to ground through a resistor of about 330 ohms to 1 kohm. The pin is high only while that device is connected. A keyboard with a touchpad lights both LEDs, because that one device fills both roles.
 
 A keyboard that also has a touchpad can fill both roles on one connection. Media keys on a keyboard are printed as `MEDIA` lines.
 
 ## Other microcontroller
 
-The folder `BleHidLink` is an Arduino library for the board on the other side of the link UART. It reads the text lines and fills a `BleHidEvent` with the key chord, mouse axes, buttons, and media key.
+The folder `BleHidLink` is an Arduino library for the board on the other side of the link UART. It reads the text lines and fills a `BleHidEvent` with the key chord, mouse axes, buttons, and media key. `onActivity()` latches the GPIO6 pulse, and `takeActivity()` returns true once for each pulse.
 
 Install it by copying `BleHidLink` into the Arduino `libraries` folder, then restart the IDE. The example is **File > Examples > BleHidLink > PrintEvents**.
 
@@ -179,11 +197,12 @@ On an Uno or Nano the example uses SoftwareSerial on pins 2 and 3 at 9600 baud. 
 
 ## If it does not connect
 
-On startup the board connects one device, then scans for the other. `Receiving...` is printed only when both are up. A later search starts only when you press BOOT or type `rescan`, and only for the role that is missing.
+On startup the board reconnects only to devices it has already paired. With no bonds saved, it waits until you short-press BOOT. `Receiving...` is printed only when both roles are up.
 
 - Confirm both devices are BLE. Classic Bluetooth hardware will never show up.
 - Remove both devices from the computer's Bluetooth list. A device that stays connected to a PC stops advertising.
-- Pair them one by one. Reset the board, wait until the first `ready` line, then put the other device in pairing mode.
+- To pair new devices, short-press BOOT once and put the keyboard in pairing mode, then the mouse. One press covers both until the missing role is filled. A reset does not pair a new device.
+- To replace one device, turn the old one off, wait for the disconnect line, then short-press BOOT and put the new one in pairing mode.
 - Watch for a `Found ...` line for each device. `Mouse is still missing.` or `Keyboard is still missing.` means the first one is connected and the scan for the other is still running.
 - If pairing fails, type `forget`, pair again, or set `kUsePasskey` to `true` and upload.
 - If the wrong nearby device is taken, set `kKeyboardName` or `kMouseName` to part of the name printed in the log.

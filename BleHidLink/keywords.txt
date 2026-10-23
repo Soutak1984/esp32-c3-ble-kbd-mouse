@@ -1,6 +1,8 @@
 BleHidLink	KEYWORD1
 BleHidEvent	KEYWORD1
 poll	KEYWORD2
+onActivity	KEYWORD2
+takeActivity	KEYWORD2
 status	KEYWORD2
 rescan	KEYWORD2
 forget	KEYWORD2
