@@ -1,6 +1,6 @@
 # ESP32-C3 BLE keyboard and mouse host
 
-The ESP32-C3 connects to a Bluetooth LE keyboard and a Bluetooth LE mouse, then prints every key, mouse move, click, and media key on serial.
+The ESP32-C3 connects to one Bluetooth LE keyboard and one Bluetooth LE mouse, one after the other, then prints every key, mouse move, click, and media key on serial.
 
 The same lines go out on the USB serial port and on a UART you can wire to another microcontroller.
 
@@ -29,19 +29,40 @@ Install the library from **Tools > Manage Libraries**. Search for `NimBLE-Arduin
 
 Unpair the keyboard and mouse from the computer before you use them here. A device that is already linked to a PC stops advertising, so the ESP32-C3 cannot see it.
 
-Put each device in pairing mode, then reset the board. The host pairs with Just Works (no PIN) and stores the bond. After a reset it looks for that one keyboard and that one mouse again.
+The board connects them one by one. Either device can be first.
 
-It does not connect a second keyboard or a second mouse. If one device disconnects, press the BOOT button (GPIO9) to scan for a replacement. The `rescan` command does the same thing. Power off the old device first if it is still connected, because the board will not add another one beside it.
+1. Put the first device in pairing mode and reset the ESP32-C3.
+2. Wait for `Keyboard ready` or `Mouse ready`. The log then names the device that is still missing and keeps scanning.
+3. Put the second device in pairing mode. You do not press BOOT between these two. The startup scan is still running.
+4. When the second device is ready, the log prints `Receiving...` and scanning stops.
 
-Startup text looks like this:
+The host pairs with Just Works (no PIN) and stores the bond. After a reset it looks for that same keyboard and that same mouse again, still one at a time.
+
+It keeps one keyboard and one mouse. It does not connect a second keyboard or a second mouse. A keyboard with a touchpad can fill both roles by itself. In that case the log says the device is both, and scanning stops.
+
+If a device disconnects after both were connected, scanning does not start by itself. Press the BOOT button (GPIO9, active low) or type `rescan`. That looks only for the keyboard or mouse that is missing. Turn the old device off first if you want a different one in its place. While both are already connected, BOOT and `rescan` do not add another device.
+
+A startup log looks like this when the keyboard is found first:
 
 ```text
 ESP32-C3 BLE HID host
+This board connects TO one BLE keyboard and one BLE mouse.
 Scanning for a BLE keyboard and mouse...
 Found Logitech K380 [aa:bb:cc:dd:ee:ff] appearance=0x03C1
 Keyboard ready: Logitech K380
+Mouse is still missing.
+Scanning for the mouse...
+Found MX Anywhere [11:22:33:44:55:66] appearance=0x03C2
 Mouse ready: MX Anywhere
 Receiving. Type on the keyboard or move the mouse.
+```
+
+After a disconnect, BOOT prints:
+
+```text
+BOOT pressed.
+Looking for a mouse.
+Scanning for the mouse...
 ```
 
 ## Output lines
@@ -158,12 +179,12 @@ On an Uno or Nano the example uses SoftwareSerial on pins 2 and 3 at 9600 baud. 
 
 ## If it does not connect
 
-On startup the board scans until one keyboard and one mouse are connected. It then stops. `Receiving...` is printed only when both are up. A later search starts only when you press BOOT or type `rescan`, and only for the role that is missing.
+On startup the board connects one device, then scans for the other. `Receiving...` is printed only when both are up. A later search starts only when you press BOOT or type `rescan`, and only for the role that is missing.
 
 - Confirm both devices are BLE. Classic Bluetooth hardware will never show up.
 - Remove both devices from the computer's Bluetooth list. A device that stays connected to a PC stops advertising.
-- Put the keyboard and the mouse in pairing mode at the same time, then reset the ESP32-C3.
-- Watch for a `Found ...` line for each device.
+- Pair them one by one. Reset the board, wait until the first `ready` line, then put the other device in pairing mode.
+- Watch for a `Found ...` line for each device. `Mouse is still missing.` or `Keyboard is still missing.` means the first one is connected and the scan for the other is still running.
 - If pairing fails, type `forget`, pair again, or set `kUsePasskey` to `true` and upload.
 - If the wrong nearby device is taken, set `kKeyboardName` or `kMouseName` to part of the name printed in the log.
 - `status` shows whether the keyboard, the mouse, or both are still missing.
