@@ -107,6 +107,7 @@ static const uint16_t kHidReport = 0x2A4D;
 static const uint16_t kProtocolMode = 0x2A4E;
 static const uint16_t kHidControlPoint = 0x2A4C;
 static const uint16_t kBootKeyboard = 0x2A22;
+static const uint16_t kBootKeyboardOutput = 0x2A32;
 static const uint16_t kBootMouse = 0x2A33;
 static const uint16_t kReportRef = 0x2908;
 
@@ -153,6 +154,15 @@ struct Slot {
   uint8_t reportCount;
   bool haveLastKey;
   bool capsLock;
+  bool numLock;
+  bool scrollLock;
+  bool haveLedId;
+  uint8_t ledMapId;
+  bool ledDirty;
+  bool ledFailNoted;
+  uint32_t ledNextMs;
+  NimBLERemoteCharacteristic* ledOutput;
+  NimBLERemoteCharacteristic* bootLed;
   uint8_t lastMod;
   uint8_t lastKeys[6];
   bool haveLastMouse;
@@ -351,6 +361,15 @@ void clearSlot(int index) {
   slot.reportCount = 0;
   slot.haveLastKey = false;
   slot.capsLock = false;
+  slot.numLock = false;
+  slot.scrollLock = false;
+  slot.haveLedId = false;
+  slot.ledMapId = 0;
+  slot.ledDirty = false;
+  slot.ledFailNoted = false;
+  slot.ledNextMs = 0;
+  slot.ledOutput = nullptr;
+  slot.bootLed = nullptr;
   slot.lastMod = 0;
   memset(slot.lastKeys, 0, sizeof(slot.lastKeys));
   slot.haveLastMouse = false;
@@ -634,6 +653,20 @@ void parseReportMap(int slotIndex, const uint8_t* data, size_t length) {
       }
       pendingUsage = 0;
       pendingPage = 0;
+    } else if (type == 0 && tag == 0x9) {
+      // Output report. Keyboard lock LEDs live on the LED usage page.
+      bool constant = (value & 0x01) != 0;
+      if (!constant) {
+        uint16_t page = pendingPage ? pendingPage : usagePage;
+        bool leds = page == 0x08;
+        bool keyboard = (appPage == 0x01 && appUsage == 0x06) || appPage == 0x07;
+        if (leds || (keyboard && !gSlots[slotIndex].haveLedId)) {
+          gSlots[slotIndex].haveLedId = true;
+          gSlots[slotIndex].ledMapId = reportId;
+        }
+      }
+      pendingUsage = 0;
+      pendingPage = 0;
     }
   }
 }
@@ -648,6 +681,85 @@ bool writeByte(NimBLERemoteCharacteristic* chr, uint8_t value) {
     return true;
   }
   return chr->writeValue(&value, 1, true);
+}
+
+bool canWriteReport(NimBLERemoteCharacteristic* chr) {
+  return chr != nullptr && (chr->canWrite() || chr->canWriteNoResponse());
+}
+
+bool writeBytes(NimBLERemoteCharacteristic* chr, const uint8_t* data, size_t length) {
+  if (!canWriteReport(chr) || data == nullptr || length == 0) {
+    return false;
+  }
+  if (chr->writeValue(data, length, false)) {
+    return true;
+  }
+  return chr->writeValue(data, length, true);
+}
+
+uint8_t keyboardLedBits(int slotIndex) {
+  const Slot& slot = gSlots[slotIndex];
+  uint8_t bits = 0;
+  if (slot.numLock) {
+    bits |= 0x01;
+  }
+  if (slot.capsLock) {
+    bits |= 0x02;
+  }
+  if (slot.scrollLock) {
+    bits |= 0x04;
+  }
+  return bits;
+}
+
+bool writeKeyboardLeds(int slotIndex) {
+  Slot& slot = gSlots[slotIndex];
+  if (slot.client == nullptr || !slot.client->isConnected()) {
+    return false;
+  }
+  uint8_t bits = keyboardLedBits(slotIndex);
+  // One byte only. Bit 0 is Num Lock, bit 1 is Caps Lock, bit 2 is Scroll Lock.
+  // The report reference already names the report. Putting the report ID in
+  // front makes this keyboard use that ID as the LED byte, so ID 1 latches
+  // Num Lock on and later writes cannot turn it off.
+  bool wrote = false;
+  if (slot.ledOutput != nullptr) {
+    wrote = writeBytes(slot.ledOutput, &bits, 1);
+  }
+  if (!wrote && slot.bootLed != nullptr) {
+    wrote = writeBytes(slot.bootLed, &bits, 1);
+  }
+  return wrote;
+}
+
+void serviceKeyboardLeds() {
+  uint32_t now = millis();
+  for (int i = 0; i < kSlotCount; i++) {
+    Slot& slot = gSlots[i];
+    if (!slot.used || !slot.ledDirty) {
+      continue;
+    }
+    if ((int32_t)(now - slot.ledNextMs) < 0) {
+      continue;
+    }
+    if (slot.ledOutput == nullptr && slot.bootLed == nullptr) {
+      slot.ledDirty = false;
+      continue;
+    }
+    uint8_t bits = keyboardLedBits(i);
+    if (!writeKeyboardLeds(i)) {
+      slot.ledNextMs = now + 300;
+      if (!slot.ledFailNoted) {
+        slot.ledFailNoted = true;
+        logf("Keyboard lock LEDs did not accept the update.");
+      }
+      continue;
+    }
+    if (keyboardLedBits(i) == bits) {
+      slot.ledDirty = false;
+      logf("Keyboard LEDs %02X.", bits);
+    }
+  }
 }
 
 bool subscribeInput(NimBLERemoteCharacteristic* chr) {
@@ -901,8 +1013,21 @@ void emitKeyboard(int slotIndex, const uint8_t* payload, size_t length) {
   if (same) {
     return;
   }
+  bool ledsChanged = false;
+  if (codeInKeys(codes, 0x53) && !codeInKeys(slot.lastKeys, 0x53)) {
+    slot.numLock = !slot.numLock;
+    ledsChanged = true;
+  }
   if (codeInKeys(codes, 0x39) && !codeInKeys(slot.lastKeys, 0x39)) {
     slot.capsLock = !slot.capsLock;
+    ledsChanged = true;
+  }
+  if (codeInKeys(codes, 0x47) && !codeInKeys(slot.lastKeys, 0x47)) {
+    slot.scrollLock = !slot.scrollLock;
+    ledsChanged = true;
+  }
+  if (ledsChanged) {
+    slot.ledDirty = true;
   }
   slot.haveLastKey = true;
   slot.lastMod = mod;
@@ -1531,6 +1656,76 @@ bool connectToServer(const NimBLEAdvertisedDevice* device) {
     }
   }
 
+  for (size_t i = 0; i < listCount; i++) {
+    NimBLERemoteCharacteristic* chr = list[i];
+    if (!(chr->getUUID() == NimBLEUUID((uint16_t)kHidReport)) || !canWriteReport(chr)) {
+      continue;
+    }
+    uint8_t reportId = 0;
+    uint8_t reportType = 1;
+    NimBLERemoteDescriptor* ref = chr->getDescriptor(NimBLEUUID((uint16_t)kReportRef));
+    if (ref != nullptr) {
+      NimBLEAttValue value = ref->readValue();
+      if (value.size() >= 2) {
+        reportId = value[0];
+        reportType = value[1];
+      }
+    }
+    if (reportType != 2) {
+      continue;
+    }
+    bool matchesLed = slot.haveLedId && reportId == slot.ledMapId;
+    bool matchesKeyboard = kindForId(slotIndex, reportId) == kKindKeyboard;
+    bool take = matchesLed || matchesKeyboard;
+    if (!take && slot.ledOutput == nullptr && !slot.haveLedId && slot.idCount == 0 &&
+        slot.appearance == kAppearanceKeyboard) {
+      take = true;
+    }
+    if (!take) {
+      continue;
+    }
+    slot.ledOutput = chr;
+  }
+  if (needKeyboard && slot.ledOutput == nullptr) {
+    NimBLERemoteCharacteristic* only = nullptr;
+    int outputs = 0;
+    for (size_t i = 0; i < listCount; i++) {
+      NimBLERemoteCharacteristic* chr = list[i];
+      if (!(chr->getUUID() == NimBLEUUID((uint16_t)kHidReport)) || !canWriteReport(chr)) {
+        continue;
+      }
+      uint8_t reportType = 1;
+      NimBLERemoteDescriptor* ref = chr->getDescriptor(NimBLEUUID((uint16_t)kReportRef));
+      if (ref != nullptr) {
+        NimBLEAttValue value = ref->readValue();
+        if (value.size() >= 2) {
+          reportType = value[1];
+        }
+      }
+      if (reportType != 2) {
+        continue;
+      }
+      outputs++;
+      only = chr;
+    }
+    if (outputs == 1) {
+      slot.ledOutput = only;
+    }
+  }
+  if (needKeyboard) {
+    NimBLERemoteCharacteristic* bootOut = service->getCharacteristic(NimBLEUUID((uint16_t)kBootKeyboardOutput));
+    if (canWriteReport(bootOut)) {
+      slot.bootLed = bootOut;
+    }
+    if (slot.ledOutput != nullptr || slot.bootLed != nullptr) {
+      slot.numLock = false;
+      slot.capsLock = false;
+      slot.scrollLock = false;
+      slot.ledDirty = true;
+      logf("Keyboard lock LEDs enabled.");
+    }
+  }
+
   int subscribed = 0;
   bool gotKeyboard = false;
   bool gotMouse = false;
@@ -1646,6 +1841,9 @@ bool connectToServer(const NimBLEAdvertisedDevice* device) {
     logf("Keyboard ready: %s", slot.name);
   } else if (slot.hasMouse) {
     logf("Mouse ready: %s", slot.name);
+  }
+  if (slot.hasKeyboard && slot.ledOutput == nullptr && slot.bootLed == nullptr) {
+    logf("This keyboard has no lock LED report. Caps Lock and Num Lock lights stay off.");
   }
   if (!stillNeed()) {
     gAllowScan = false;
@@ -2193,6 +2391,7 @@ void loop() {
     }
   }
 
+  serviceKeyboardLeds();
   serviceLinkLeds();
   serviceActivity();
   pollBoot();

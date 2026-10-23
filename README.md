@@ -87,7 +87,7 @@ RAW   Name [addr] 01 02 00
 
 | Prefix | Meaning |
 | --- | --- |
-| `KBD` | The typed character. Shift+a prints `A`, Shift+1 prints `!`. Ctrl stays in front, such as `LCTRL+c`. `null` means every key was released. The Up arrow is `Up`. Shift by itself is not printed. With GPIO7 tied to ground, the same key is only its hex usage, such as `1D` or `E0`, and a release is not printed. |
+| `KBD` | The typed character. Shift+a prints `A`, Shift+1 prints `!`. Ctrl stays in front, such as `LCTRL+c`. `null` means every key was released. The Up arrow is `Up`. Shift by itself is not printed. Caps Lock, Num Lock, and Scroll Lock are sent back to the keyboard so its own lights follow those keys. With GPIO7 tied to ground, the same key is only its hex usage, such as `1D` or `E0`, and a release is not printed. |
 | `MOUSE` | Buttons (`L`, `R`, `M`, `Back`, `Fwd`, or `-`), then `x`, `y`, `wheel`, and `pan`. Movement is grouped about every 40 ms. Clicks and the wheel print immediately. |
 | `MEDIA` | Volume, play, and other consumer keys. `null` is the release. |
 | `RAW` | A HID report the sketch could not decode. The bytes are hex. |
